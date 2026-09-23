@@ -3,7 +3,7 @@
 # odoo-backup.sh
 # ---------------------------------------------------------------------------
 # Author : Eng. Samir (Eng.Samir)
-# Version: 4.0 — auto-detect edition
+# Version: 4.1 — auto-detect edition
 # ---------------------------------------------------------------------------
 #
 # Auto-detects the Postgres + Odoo Docker containers, credentials, the
@@ -146,7 +146,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 mkdir -p "$WORKDIR"
 
-log "Starting Odoo backup on ${HOSTNAME}... (odoo-backup.sh v4.0 - Eng.Samir)"
+log "Starting Odoo backup on ${HOSTNAME}... (odoo-backup.sh v4.1 - Eng.Samir)"
 
 available_kb=$(df --output=avail "$WORKDIR" | tail -n1 | tr -d ' ')
 if [ "$available_kb" -lt "$MIN_FREE_KB" ]; then
@@ -187,7 +187,7 @@ fi
 
 # Pick the largest real database (skips template0/template1/postgres)
 DB=$(docker exec -e PGPASSWORD="$DB_PASSWORD" "$DB_CONTAINER" \
-    psql -U "$DB_USER" -tAc \
+    psql -U "$DB_USER" -d postgres -tAc \
     "SELECT datname FROM pg_database
      WHERE datname NOT IN ('template0','template1','postgres')
      ORDER BY pg_database_size(datname) DESC LIMIT 1;" | tr -d '[:space:]')
