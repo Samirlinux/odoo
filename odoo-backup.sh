@@ -2,13 +2,15 @@
 #
 # odoo-backup.sh
 # ---------------------------------------------------------------------------
-# Author : Eng. Samir Abo el khair
-# Version: 3.0
+# Author : Eng. Samir (Eng.Samir)
+# Version: 4.0 — auto-detect edition
 # ---------------------------------------------------------------------------
 #
-# Dumps Odoo PostgreSQL DB + filestore, ships to a remote backup server,
-# and triggers remote processing. Sends Telegram / Slack / Email alerts
-# on success and failure.
+# Auto-detects the Postgres + Odoo Docker containers, credentials, the
+# largest real database, and the filestore path on ANY server that matches
+# this stack — no per-server DB config needed. Dumps DB + filestore, ships
+# to a remote backup server, and triggers remote processing. Sends
+# Telegram / Slack / Email alerts on success and failure.
 #
 # Recommended cron entry (runs at 2am daily, logs already handled inside):
 #   0 2 * * * /usr/local/bin/odoo-backup.sh
@@ -17,17 +19,20 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Config
+# Backup-server config — loaded from /etc/odoo-backup/config.env
+# (this part IS the same for every server, so it stays in a small config file)
 # ---------------------------------------------------------------------------
-DB="MegaTrust_2021_new"
-DB_CONTAINER="odoo13-docker-db-1"
-DB_USER="odoo"
-DB_PASSWORD="odoo16@2023"
-FILESTORE_HOST_PATH="/var/lib/docker/volumes/odoo13-docker_odoo-web-data/_data/filestore"
+CONFIG_ENV="/etc/odoo-backup/config.env"
+if [ ! -f "$CONFIG_ENV" ]; then
+    echo "ERROR: Missing ${CONFIG_ENV}. Copy config.env.example there and fill it in." >&2
+    exit 1
+fi
+# shellcheck source=/etc/odoo-backup/config.env
+source "$CONFIG_ENV"
 
-BACKUP_SERVER="188.40.242.120"
-BACKUP_USER="root"
-SSH_KEY="/root/.ssh/odoo_backup_key"
+: "${BACKUP_SERVER:?BACKUP_SERVER not set in ${CONFIG_ENV}}"
+: "${BACKUP_USER:?BACKUP_USER not set in ${CONFIG_ENV}}"
+: "${SSH_KEY:?SSH_KEY not set in ${CONFIG_ENV}}"
 
 DATE=$(date +%Y-%m-%d)
 HOSTNAME=$(hostname)
@@ -141,7 +146,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 mkdir -p "$WORKDIR"
 
-log "Starting Odoo backup for DB '${DB}' on ${HOSTNAME}... (odoo-backup.sh v3.0 - Eng.Samir)"
+log "Starting Odoo backup on ${HOSTNAME}... (odoo-backup.sh v4.0 - Eng.Samir)"
 
 available_kb=$(df --output=avail "$WORKDIR" | tail -n1 | tr -d ' ')
 if [ "$available_kb" -lt "$MIN_FREE_KB" ]; then
@@ -153,6 +158,56 @@ if ! ssh $SSH_OPTS "${BACKUP_USER}@${BACKUP_SERVER}" "echo ok" >/dev/null 2>&1; 
     log "ERROR: Cannot reach backup server ${BACKUP_SERVER} via SSH."
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# Auto-detect: postgres container, odoo container, credentials, DB, filestore
+# ---------------------------------------------------------------------------
+log "Auto-detecting Odoo/Postgres containers..."
+
+DB_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' | awk -F'\t' 'tolower($2) ~ /postgres/ {print $1; exit}')
+ODOO_CONTAINER=$(docker ps --format '{{.Names}}\t{{.Image}}' | awk -F'\t' 'tolower($2) ~ /odoo/ {print $1; exit}')
+
+if [ -z "$DB_CONTAINER" ]; then
+    log "ERROR: No running container with a 'postgres' image found (docker ps)."
+    exit 1
+fi
+if [ -z "$ODOO_CONTAINER" ]; then
+    log "ERROR: No running container with an 'odoo' image found (docker ps)."
+    exit 1
+fi
+log "Found DB container: ${DB_CONTAINER} / Odoo container: ${ODOO_CONTAINER}"
+
+DB_USER=$(docker exec "$DB_CONTAINER" env | awk -F= '/^POSTGRES_USER=/{print $2; exit}')
+DB_PASSWORD=$(docker exec "$DB_CONTAINER" env | awk -F= '/^POSTGRES_PASSWORD=/{print $2; exit}')
+
+if [ -z "$DB_USER" ] || [ -z "$DB_PASSWORD" ]; then
+    log "ERROR: Could not read POSTGRES_USER/POSTGRES_PASSWORD from ${DB_CONTAINER}."
+    exit 1
+fi
+
+# Pick the largest real database (skips template0/template1/postgres)
+DB=$(docker exec -e PGPASSWORD="$DB_PASSWORD" "$DB_CONTAINER" \
+    psql -U "$DB_USER" -tAc \
+    "SELECT datname FROM pg_database
+     WHERE datname NOT IN ('template0','template1','postgres')
+     ORDER BY pg_database_size(datname) DESC LIMIT 1;" | tr -d '[:space:]')
+
+if [ -z "$DB" ]; then
+    log "ERROR: Could not determine target database inside ${DB_CONTAINER}."
+    exit 1
+fi
+log "Selected database: ${DB} (largest by size)"
+
+# Filestore lives on the host wherever the odoo container's /var/lib/odoo is mounted
+ODOO_DATA_SOURCE=$(docker inspect "$ODOO_CONTAINER" \
+    --format '{{range .Mounts}}{{if eq .Destination "/var/lib/odoo"}}{{.Source}}{{end}}{{end}}')
+
+if [ -z "$ODOO_DATA_SOURCE" ]; then
+    log "ERROR: Could not find a /var/lib/odoo mount on container ${ODOO_CONTAINER}."
+    exit 1
+fi
+FILESTORE_HOST_PATH="${ODOO_DATA_SOURCE}/filestore"
+log "Filestore base path: ${FILESTORE_HOST_PATH}"
 
 # ---------------------------------------------------------------------------
 # Dump PostgreSQL database (running inside Docker container)
